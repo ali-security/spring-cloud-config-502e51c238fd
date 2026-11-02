@@ -1,0 +1,84 @@
+# Seal build: upstream 2.2.x has no GitHub Actions CI (only .circleci/config.yml).
+# This translates the CircleCI "Running build" job (JDK 8, ./mvnw = Maven 3.5.0,
+# clean install with tests) scoped to the spring-cloud-config-server module and
+# the modules it depends on.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      _JAVA_OPTIONS: "-Xms1024m -Xmx2048m"
+      TERM: dumb
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      - name: Drop repo.spring.io profile from .mvn/maven.config
+        # .mvn/maven.config activates -P spring (repo.spring.io repositories, now
+        # behind auth); everything for this release resolves from Maven Central.
+        run: ": > .mvn/maven.config"
+
+      - name: Build and test
+        run: |
+          MVN_FLAGS="-B -e -V -nsu -Dmaven.test.redirectTestOutputToFile=true -Dmaven.javadoc.skip=true -Dgpg.skip=true -Ddisable.checks=true -Dcheckstyle.skip=true -Dspring-javaformat.skip=true -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn"
+          MODULES="spring-cloud-config-server"
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./mvnw $MVN_FLAGS -pl $MODULES -am clean install -Dtest='${{ inputs.test-filter }}' -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
+          else
+            ./mvnw $MVN_FLAGS -pl $MODULES -am clean install
+          fi
+
+      - name: Test results summary and skipped tests
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, os, re, xml.etree.ElementTree as ET
+          tot = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          for rep in sorted(glob.glob("**/target/surefire-reports/TEST-*.xml", recursive=True)):
+              root = ET.parse(rep).getroot()
+              mod = rep.split("/target/")[0]
+              for k in tot:
+                  tot[k] += int(root.get(k, 0))
+              for tc in root.iter("testcase"):
+                  sk = tc.find("skipped")
+                  if sk is None:
+                      continue
+                  cls, name = tc.get("classname", ""), tc.get("name", "")
+                  msg = sk.get("message") or ""
+                  if not msg:
+                      src = glob.glob(f"{mod}/src/test/java/" + cls.replace(".", "/") + ".java")
+                      if src:
+                          lines = open(src[0], encoding="utf-8").read().splitlines()
+                          for i, l in enumerate(lines):
+                              if re.search(r"@(Ignore|Disabled)", l):
+                                  ctx = " ".join(x.strip() for x in lines[i:i + 4])
+                                  if name in ctx or "class " in ctx:
+                                      msg = "source: " + ctx
+                                      break
+                  print(f"SKIPPED {cls}.{name}: {msg or 'no reason recorded'}")
+          print("SUMMARY tests={tests} failures={failures} errors={errors} skipped={skipped} passed={p}".format(
+              p=tot["tests"] - tot["failures"] - tot["errors"] - tot["skipped"], **tot))
+          EOF
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-cloud-config-server-jars
+          path: |
+            spring-cloud-config-server/target/spring-cloud-config-server-2.2.6.RELEASE.jar
+            spring-cloud-config-server/target/spring-cloud-config-server-2.2.6.RELEASE-tests.jar
+          if-no-files-found: error
